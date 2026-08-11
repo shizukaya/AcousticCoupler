@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Browser Acoustic Coupler</title>
+
+<style>
+
+body{
+    background:#111;
+    color:#0f0;
+    font-family:Consolas,monospace;
+    margin:0;
+    padding:20px;
+}
+
+#main{
+    width:900px;
+    margin:auto;
+}
+
+.panel{
+    border:2px solid #0f0;
+    padding:10px;
+    margin-bottom:15px;
+}
+
+button{
+    background:#222;
+    color:#0f0;
+    border:1px solid #0f0;
+    padding:10px 20px;
+    cursor:pointer;
+    margin-right:5px;
+}
+
+button:hover{
+    background:#060;
+}
+
+input{
+    width:95%;
+    font-size:18px;
+    background:black;
+    color:#0f0;
+    border:1px solid #0f0;
+    padding:6px;
+}
+
+textarea{
+    width:100%;
+    height:180px;
+    background:black;
+    color:#0f0;
+    border:1px solid #0f0;
+    resize:none;
+}
+
+canvas{
+    width:100%;
+    height:180px;
+    background:black;
+    border:1px solid #0f0;
+}
+
+.led{
+    width:18px;
+    height:18px;
+    border-radius:50%;
+    display:inline-block;
+    background:#300;
+    margin-right:5px;
+}
+
+.on{
+    background:red;
+    box-shadow:0 0 12px red;
+}
+
+.green{
+    background:#030;
+}
+
+.green.on{
+    background:#0f0;
+    box-shadow:0 0 10px #0f0;
+}
+
+</style>
+</head>
+
+<body>
+
+<div id="main">
+
+<h2>Browser Acoustic Coupler</h2>
+
+<div class="panel">
+
+<div>送信文字列</div>
+
+<input id="txtSend" value="HELLO">
+
+<br><br>
+
+<button id="btnInit">マイク開始</button>
+<button id="btnSend">送信</button>
+<button id="btnStop">停止</button>
+
+</div>
+
+<div class="panel">
+POWER <div id="ledPower" class="led"></div>
+RX <div id="ledRX" class="led green"></div>
+TX <div id="ledTX" class="led"></div>
+CARRIER <div id="ledCarrier" class="led green"></div>
+</div>
+
+<div class="panel">
+スペクトラム
+<canvas id="scope" width="800" height="180"></canvas>
+</div>
+
+<div class="panel">
+受信文字列
+<textarea id="txtReceive"></textarea>
+</div>
+
+<div class="panel">
+ログ
+<textarea id="txtLog"></textarea>
+</div>
+
+<div class="panel">
+デバッグ情報（受信レベル／周波数／状態）
+<div id="debugInfo" style="font-size:20px;">-</div>
+</div>
+
+<div class="panel">
+単音テスト（マイク開始後に押してください。3秒間鳴らします）
+<br><br>
+<button id="btnTestStart">START (800Hz)</button>
+<button id="btnTestStop">STOP (900Hz)</button>
+<button id="btnTestBit0">BIT0 (1200Hz)</button>
+<button id="btnTestBit1">BIT1 (2200Hz)</button>
+</div>
+
+</div>
+
+<script>
+
+const START_FREQ=800;
+const STOP_FREQ=900;
+
+const BIT0=1200;
+const BIT1=2200;
+
+const BIT_TIME=0.1;
+
+let audioCtx=null;
+let analyser=null;
+let source=null;
+let stream=null;
+
+// 受信帯域を限定して環境音を除外する
+let highPassFilter=null;
+let lowPassFilter=null;
+const RX_HIGH_PASS_FREQ=750;
+const RX_LOW_PASS_FREQ=2800;
+
+let fftData=null;
+let timeData=null;
+let monitorTimer=null;
+
+let receiving=false;
+
+function log(s){
+    txtLog.value+=s+"\n";
+    txtLog.scrollTop=txtLog.scrollHeight;
+}
+
+function led(id,on){
+    const e=document.getElementById(id);
+    if(on)
+        e.classList.add("on");
+    else
+        e.classList.remove("on");
+}
+
+led("ledPower",true);
+const canvas=document.getElementById("scope");
+const g=canvas.getContext("2d");
+
+function checksum(bytes){
+    let c=0;
+    for(const b of bytes){
+        c=(c+b)&255;
+    }
+    return c;
+}
+
+async function sendData(text){
+    if(audioCtx==null){
+        audioCtx=new AudioContext();
+    }
+    const osc=audioCtx.createOscillator();
+    const gain=audioCtx.createGain();
+    gain.gain.value=0.18;
+    osc.type="sine";
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    const enc=new TextEncoder();
+    const bytes=Array.from(enc.encode(text));
+    bytes.push(checksum(bytes));
+    osc.start();
+    let t=audioCtx.currentTime+0.1;
+    led("ledTX",true);
+    log("送信開始");
+    // キャリア
+    osc.frequency.setValueAtTime(START_FREQ,t);
+    t+=0.25;
+    // プレアンブル
+    for(let i=0;i<32;i++){
+        osc.frequency.setValueAtTime(
+            i&1 ? BIT1 : BIT0,
+            t
+        );
+        t+=BIT_TIME;
+    }
+    // データ
+    for(const b of bytes){
+        for(let i=7;i>=0;i--){
+            const bit=(b>>i)&1;
+            osc.frequency.setValueAtTime(
+                bit ? BIT1 : BIT0,
+                t
+            );
+            t+=BIT_TIME;
+        }
+    }
+    // 終了
+    osc.frequency.setValueAtTime(STOP_FREQ,t);
+    t+=0.2;
+    osc.stop(t);
+    osc.onended=()=>{
+        led("ledTX",false);
+        log("送信終了");
+    };
+}
+
+btnSend.onclick=()=>{
+    sendData(txtSend.value);
+};
+
+btnStop.onclick=()=>{
+    receiving=false;
+    if(monitorTimer){
+        clearInterval(monitorTimer);
+        monitorTimer=null;
+    }
+    if(stream){
+        stream.getTracks().forEach(t=>t.stop());
+    }
+    log("停止");
+};
+
+async function playTestTone(freq,label,duration){
+    if(audioCtx==null)
+        audioCtx=new AudioContext();
+    const osc=audioCtx.createOscillator();
+    const gain=audioCtx.createGain();
+    gain.gain.value=0.18;
+    osc.type="sine";
+    osc.frequency.setValueAtTime(freq,audioCtx.currentTime);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime+duration);
+    log("["+label+" "+freq+"Hz] 再生開始（"+duration+"秒）");
+    if(!receiving){
+        log("　※マイク開始を先に押してください（判定ログは出ません）");
+        return;
+    }
+    const iv=setInterval(()=>{
+        log("  "+lastToneSnapshot);
+    },500);
+    setTimeout(()=>{
+        clearInterval(iv);
+        log("["+label+"] 再生終了\n");
+    },duration*1000+300);
+}
+
+btnTestStart.onclick=()=>playTestTone(START_FREQ,"START",3);
+btnTestStop.onclick=()=>playTestTone(STOP_FREQ,"STOP",3);
+btnTestBit0.onclick=()=>playTestTone(BIT0,"BIT0",3);
+btnTestBit1.onclick=()=>playTestTone(BIT1,"BIT1",3);
+
+btnInit.onclick=async()=>{
+    try{
+        audioCtx=new AudioContext();
+        // モバイルブラウザではAudioContextがsuspended状態の
+        // ままになることがあるため明示的にresumeする
+        if(audioCtx.state=="suspended"){
+            await audioCtx.resume();
+        }
+        log("AudioContext state: "+audioCtx.state);
+        stream=await navigator.mediaDevices.getUserMedia({
+            audio:{
+                echoCancellation:false,
+                noiseSuppression:false,
+                autoGainControl:true
+            }
+        });
+        source=audioCtx.createMediaStreamSource(stream);
+        // マイク入力に帯域フィルタを入れる。
+        // この通信で使う周波数は 800 / 900 / 1200 / 2200 Hz なので、
+        // 650Hz未満の低周波環境音と2800Hz以上の音を受信判定から除外する。
+        highPassFilter=audioCtx.createBiquadFilter();
+        highPassFilter.type="highpass";
+        highPassFilter.frequency.value=RX_HIGH_PASS_FREQ;
+        highPassFilter.Q.value=0.707;
+
+        lowPassFilter=audioCtx.createBiquadFilter();
+        lowPassFilter.type="lowpass";
+        lowPassFilter.frequency.value=RX_LOW_PASS_FREQ;
+        lowPassFilter.Q.value=0.707;
+
+        analyser=audioCtx.createAnalyser();
+        analyser.fftSize=1024;
+        fftData=new Float32Array(analyser.frequencyBinCount);
+        timeData=new Float32Array(analyser.fftSize);
+
+        source.connect(highPassFilter);
+        highPassFilter.connect(lowPassFilter);
+        lowPassFilter.connect(analyser);
+
+        receiving=true;
+        log("マイク開始");
+        monitorTimer=setInterval(()=>{
+            log("[モニタ] "+lastToneSnapshot);
+        },1000);
+        receiveLoop();
+        drawSpectrum();
+    }
+    catch(err){
+        log("マイク開始エラー: "+err.name+" - "+err.message);
+        alert("マイクを開始できませんでした:\n"+err.name+"\n"+err.message+
+              "\n\nAndroidの場合、Chromeアプリ自体のマイク権限が"+
+              "OS設定で許可されているか確認してください。");
+    }
+};
+
+function goertzelMag(samples,targetFreq,sampleRate){
+    const N=samples.length;
+    const k=Math.round((N*targetFreq)/sampleRate);
+    const omega=(2*Math.PI*k)/N;
+    const cosine=Math.cos(omega);
+    const sine=Math.sin(omega);
+    const coeff=2*cosine;
+    let q0=0,q1=0,q2=0;
+    for(let i=0;i<N;i++){
+        q0=coeff*q1-q2+samples[i];
+        q2=q1;
+        q1=q0;
+    }
+    const real=q1-q2*cosine;
+    const imag=q2*sine;
+    return Math.sqrt(real*real+imag*imag);
+}
+
+const TONE_THRESHOLD_DB=-50;
+let lastToneSnapshot="";
+let lastDebugUpdate=0;
+let lastBit0Db=-999;
+let lastBit1Db=-999;
+
+function classifyTone(){
+    analyser.getFloatTimeDomainData(timeData);
+    const N=timeData.length;
+    const sr=audioCtx.sampleRate;
+    const mStart=goertzelMag(timeData,START_FREQ,sr);
+    const mStop=goertzelMag(timeData,STOP_FREQ,sr);
+    const mBit0=goertzelMag(timeData,BIT0,sr);
+    const mBit1=goertzelMag(timeData,BIT1,sr);
+    const toDb=m=>20*Math.log10(m/(N/2)+1e-9);
+    const candidates=[
+        {name:"START",mag:mStart},
+        {name:"STOP",mag:mStop},
+        {name:"BIT0",mag:mBit0},
+        {name:"BIT1",mag:mBit1}
+    ];
+    candidates.sort((a,b)=>b.mag-a.mag);
+    const best=candidates[0];
+    const level=toDb(best.mag);
+    lastBit0Db=toDb(mBit0);
+    lastBit1Db=toDb(mBit1);
+    lastToneSnapshot=
+        "START:"+toDb(mStart).toFixed(1)+
+        " STOP:"+toDb(mStop).toFixed(1)+
+        " BIT0:"+toDb(mBit0).toFixed(1)+
+        " BIT1:"+toDb(mBit1).toFixed(1)+
+        " => "+best.name+"("+level.toFixed(1)+"dB) state="+state;
+    const now=performance.now();
+    if(now-lastDebugUpdate>150){
+        lastDebugUpdate=now;
+        document.getElementById("debugInfo").textContent=lastToneSnapshot;
+    }
+    if(level<TONE_THRESHOLD_DB)
+        return null;
+
+    // 期待する4周波数から大きく外れた環境音を除外する。
+    // 特に低域の環境音が強い場合、Goertzelの漏れ込みで
+    // 800/900Hz付近が誤検出されることがあるため、低域の強さも確認する。
+    const low300=goertzelMag(timeData,300,sr);
+    const low500=goertzelMag(timeData,500,sr);
+    const lowOutOfBand=Math.max(low300,low500);
+
+    // 低域が候補周波数より十分強いフレームは受信判定に使わない。
+    // 1.8倍未満なら通信音の周辺成分として許容する。
+    if(lowOutOfBand > best.mag*1.8)
+        return null;
+
+    return best.name;
+}
+
+let state="WAIT";
+let bits=[];
+let bytes=[];
+let startCount=0;
+let stopCount=0;
+const START_CONFIRM_FRAMES=6;
+const STOP_CONFIRM_FRAMES=4;
+
+let nextSampleTime=0;
+let bit0Votes=0;
+let bit1Votes=0;
+
+let carrierEnded=false;
+let carrierEndConfirm=0;
+const CARRIER_END_CONFIRM_FRAMES=2;
+
+function receiveLoop(){
+    if(!receiving)
+        return;
+    requestAnimationFrame(receiveLoop);
+    const tone=classifyTone();
+    const now=performance.now();
+    if(state=="WAIT"){
+        if(tone=="START"){
+            startCount++;
+        }else{
+            startCount=0;
+        }
+        if(startCount>=START_CONFIRM_FRAMES){
+            startCount=0;
+            stopCount=0;
+            state="SYNC";
+            bits=[];
+            bytes=[];
+            // キャリア終わる瞬間(最初のプリアンブルビットへの切り替わり)を検出してから。
+            // キャリア確定にかかったデバウンス時間による誤差を避けるためまだタイマーを開始しない。
+            carrierEnded=false;
+            carrierEndConfirm=0;
+            bit0Votes=0;
+            bit1Votes=0;
+            led("ledCarrier",true);
+            log("キャリア検出");
+        }
+        return;
+    }
+    if(tone=="STOP"){
+        stopCount++;
+    }else{
+        stopCount=0;
+    }
+    if(stopCount>=STOP_CONFIRM_FRAMES){
+        stopCount=0;
+        led("ledCarrier",false);
+        state="WAIT";
+        if(bytes.length>1){
+            const recvSum=bytes.pop();
+            const calcSum=checksum(bytes);
+            if(recvSum==calcSum){
+                const dec=new TextDecoder();
+                const txt=dec.decode(
+                    new Uint8Array(bytes)
+                );
+                txtReceive.value+=txt+"\n";
+                led("ledRX",true);
+                setTimeout(()=>{
+                    led("ledRX",false);
+                },200);
+                log("受信："+txt);
+            }else{
+                log("Checksum Error");
+            }
+        }
+        return;
+    }
+
+    // キャリア(がまだ終わっていない間は、その終了瞬間を検出するまで待つ。
+    if(!carrierEnded){
+        if(tone!="START"){
+            carrierEndConfirm++;
+        }else{
+            carrierEndConfirm=0;
+        }
+        if(carrierEndConfirm>=CARRIER_END_CONFIRM_FRAMES){
+            carrierEnded=true;
+            // 検出した瞬間は最初のプリアンブルビットの
+            // 開始直後なので、その半分の時点でサンプリングする
+            nextSampleTime=now+BIT_TIME*1000/2;
+            bit0Votes=0;
+            bit1Votes=0;
+        }
+        return;
+    }
+    // 1ビット期間中、毎フレームどちらのトーンが強いか投票しておき、
+    // 期間の終わりに多数決で決定する(単発ノイズに強くする)
+    if(lastBit1Db>lastBit0Db){
+        bit1Votes++;
+    }else{
+        bit0Votes++;
+    }
+    if(now<nextSampleTime)
+        return;
+    nextSampleTime+=BIT_TIME*1000;
+    const bit=(bit1Votes>bit0Votes)?1:0;
+    bit0Votes=0;
+    bit1Votes=0;
+    bits.push(bit);
+    if(state=="SYNC"){
+        if(bits.length>=32){
+            bits=[];
+            state="DATA";
+            log("同期完了");
+        }
+        return;
+    }
+
+    if(bits.length==8){
+        let value=0;
+        for(const b of bits){
+            value=(value<<1)|b;
+        }
+        bytes.push(value);
+        log("byte: 0x"+value.toString(16).padStart(2,"0")+
+            " ("+bits.join("")+") '"+
+            (value>=32&&value<127?String.fromCharCode(value):"?")+"'");
+        bits=[];
+    }
+}
+
+function drawSpectrum(){
+    if(!receiving)
+        return;
+    requestAnimationFrame(drawSpectrum);
+    analyser.getFloatFrequencyData(fftData);
+    g.fillStyle="black";
+    g.fillRect(0,0,canvas.width,canvas.height);
+    g.strokeStyle="#00ff00";
+    g.beginPath();
+    for(let i=0;i<fftData.length;i++){
+        let x=i*canvas.width/fftData.length;
+        let y=(fftData[i]+120)/120*canvas.height;
+        if(y<0)y=0;
+        if(y>canvas.height)y=canvas.height;
+        if(i==0)
+            g.moveTo(x,canvas.height-y);
+        else
+            g.lineTo(x,canvas.height-y);
+    }
+    g.stroke();
+    // 1200Hz
+    g.strokeStyle="yellow";
+    let x0=BIT0/(audioCtx.sampleRate/analyser.fftSize)
+            *canvas.width/fftData.length;
+    g.beginPath();
+    g.moveTo(x0,0);
+    g.lineTo(x0,canvas.height);
+    g.stroke();
+    //2200Hz
+    let x1=BIT1/(audioCtx.sampleRate/analyser.fftSize)
+            *canvas.width/fftData.length;
+    g.beginPath();
+    g.moveTo(x1,0);
+    g.lineTo(x1,canvas.height);
+    g.stroke();
+    //開始
+    g.strokeStyle="cyan";
+    let xs=START_FREQ/(audioCtx.sampleRate/analyser.fftSize)
+            *canvas.width/fftData.length;
+    g.beginPath();
+    g.moveTo(xs,0);
+    g.lineTo(xs,canvas.height);
+    g.stroke();
+    //終了
+    let xe=STOP_FREQ/(audioCtx.sampleRate/analyser.fftSize)
+            *canvas.width/fftData.length;
+    g.beginPath();
+    g.moveTo(xe,0);
+    g.lineTo(xe,canvas.height);
+    g.stroke();
+}
+
+async function playHandshake(){
+
+    if(audioCtx==null)
+        audioCtx=new AudioContext();
+
+    const osc=audioCtx.createOscillator();
+    const gain=audioCtx.createGain();
+    gain.gain.value=0.2;
+    osc.type="sine";
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    let t=audioCtx.currentTime;
+    osc.start();
+    osc.frequency.setValueAtTime(900,t);
+    t+=0.15;
+    osc.frequency.linearRampToValueAtTime(1800,t);
+    t+=0.15;
+    osc.frequency.linearRampToValueAtTime(1200,t);
+    t+=0.15;
+    osc.frequency.linearRampToValueAtTime(2200,t);
+    t+=0.15;
+    osc.frequency.linearRampToValueAtTime(1200,t);
+    t+=0.15;
+    osc.frequency.setValueAtTime(START_FREQ,t);
+    t+=0.2;
+    osc.stop(t);
+}
+
+btnSend.onclick=async()=>{
+    await playHandshake();
+    setTimeout(()=>{
+        sendData(txtSend.value);
+    },900);
+};
+
+</script>
+
+</body>
+</html>
