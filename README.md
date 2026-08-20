@@ -10,3 +10,6 @@ const BIT0=1200;<br>
 const BIT1=2200;<br>
 const RX_HIGH_PASS_FREQ=750;<br>
 const RX_LOW_PASS_FREQ=2800;<br>
+<br>
+サンプルページ<br>
+<a href="https://shizukaya.github.io/AcousticCoupler/AcousticCoupler.html">AcousticCoupler</a>
